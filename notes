@@ -1,0 +1,21 @@
+
+https://github.com/torvalds/linux/blob/9b6de136b5f0158c60844f85286a593cb70fb364/include/uapi/linux/in.h#L178
+
+struct ip_mreq  {
+	struct in_addr imr_multiaddr;	/* IP multicast address of group */
+	struct in_addr imr_interface;	/* local IP address of interface */
+};
+
+struct ip_mreqn {
+	struct in_addr	imr_multiaddr;		/* IP multicast address of group */
+	struct in_addr	imr_address;		/* local IP address of interface */
+	int		imr_ifindex;		/* Interface index */
+};
+
+struct ip_mreq_source {
+	__be32		imr_multiaddr;
+	__be32		imr_interface;
+	__be32		imr_sourceaddr;
+};
+
+https://github.com/golang/go/issues/41854
