@@ -1,0 +1,103 @@
+func mcastOpen(bindAddr net.IP, port int) (*ipv4.PacketConn, error) {
+
+	startTime := time.Now()
+	defer func() {
+		pH.WithLabelValues("mcastOpen", "start", "complete").Observe(time.Since(startTime).Seconds())
+	}()
+	pC.WithLabelValues("mcastOpen", "start", "counter").Inc()
+
+	if debugLevel > 10 {
+		log.Println("mcastOpen start")
+	}
+
+	// https://pkg.go.dev/syscall#Socket
+	// https://pkg.go.dev/syscall#pkg-constants
+	//s, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_UDP)
+	s, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.AF_UNSPEC)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := syscall.SetsockoptInt(s, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+		log.Fatal(err)
+	}
+
+	// Dave - NOT doing this for now.  I don't think it's required.  Testing....
+	// //syscall.SetsockoptInt(s, syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
+	// if err := syscall.SetsockoptString(s, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, ifname); err != nil {
+	// 	log.Fatal(err)
+	// }
+
+	lsa := syscall.SockaddrInet4{Port: port}
+	copy(lsa.Addr[:], bindAddr.To4())
+
+	if err := syscall.Bind(s, &lsa); err != nil {
+		syscall.Close(s)
+		log.Fatal(err)
+	}
+
+	// start hack
+
+	// https://cs.opensource.google/go/go/+/refs/tags/go1.21.4:src/syscall/ztypes_linux_amd64.go;l=216
+	// type IPMreq struct {
+	// 	Multiaddr [4]byte /* in_addr */
+	// 	Interface [4]byte /* in_addr */
+	// }
+
+	// type IPMreqn struct {
+	// 	Multiaddr [4]byte /* in_addr */
+	// 	Address   [4]byte /* in_addr */
+	// 	Ifindex   int32
+	// }
+
+	// https://github.com/torvalds/linux/blob/9b6de136b5f0158c60844f85286a593cb70fb364/include/uapi/linux/in.h#L178
+	// struct ip_mreq  {
+	// 	struct in_addr imr_multiaddr;	/* IP multicast address of group */
+	// 	struct in_addr imr_interface;	/* local IP address of interface */
+	// };
+
+	// struct ip_mreqn {
+	// 	struct in_addr	imr_multiaddr;		/* IP multicast address of group */
+	// 	struct in_addr	imr_address;		/* local IP address of interface */
+	// 	int		imr_ifindex;		/* Interface index */
+	// };
+
+	// struct ip_mreq_source {               <---- MISSING FROM GOLANG
+	// 	__be32		imr_multiaddr;
+	// 	__be32		imr_interface;
+	// 	__be32		imr_sourceaddr;
+	// };
+
+	// Try this hack.  Use ip_mreqn instead of ip_mreq_source
+	// https://pkg.go.dev/syscall#SetsockoptIPMreqn
+	//
+	// Golang does have "IP_ADD_SOURCE_MEMBERSHIP         = 0x27" ( https://pkg.go.dev/syscall#pkg-constants )
+
+	if debugLevel > 10 {
+		log.Println("starting hack")
+	}
+
+	sourceAddress := []byte{0x01, 0x01, 0x01, 0x01}
+	var sa uint32
+	binary.LittleEndian.PutUint32(sourceAddress, sa)
+	ipMreqSourceHack := &syscall.IPMreqn{
+		//imr_multiaddr;
+		//imr_interface;       <----- defaults to zero (0) in golang, so this will defer to the kernel, which is what we want
+		Ifindex: int32(sa), // Ifindex is really imr_sourceaddr
+	}
+
+	if err := syscall.SetsockoptIPMreqn(s, syscall.IPPROTO_IP, syscall.IP_ADD_SOURCE_MEMBERSHIP, ipMreqSourceHack); err != nil {
+		log.Fatal(err)
+	}
+
+	// end hack
+
+	f := os.NewFile(uintptr(s), "")
+	c, err := net.FilePacketConn(f)
+	f.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
+	p := ipv4.NewPacketConn(c)
+
+	return p, nil
+}

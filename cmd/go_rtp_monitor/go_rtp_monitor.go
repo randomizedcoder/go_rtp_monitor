@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
@@ -13,14 +12,39 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/pion/rtp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/net/ipv4"
 )
+
+// Found a package that has RTP, so let's use that
+// "github.com/pion/rtp"
+// https://github.com/pion/rtp/blob/master/packet.go
+//
+// https://www.rfc-editor.org/rfc/rfc3550#section-5.1
+//
+// 5.1 RTP Fixed Header Fields
+
+//    The RTP header has the following format:
+
+//     0                   1                   2                   3
+//     0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//    |V=2|P|X|  CC   |M|     PT      |       sequence number         |
+//    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//    |                           timestamp                           |
+//    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//    |           synchronization source (SSRC) identifier            |
+//    +=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+
+//    |            contributing source (CSRC) identifiers             |
+//    |                             ....                              |
+//    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
 const (
 	debugLevelCst = 11
@@ -35,8 +59,17 @@ const (
 	quantileError    = 0.05
 	summaryVecMaxAge = 5 * time.Minute
 
-	defaultUDPPortCst = 6666
-	defaultIPAddressCst = "225.0.0.1"
+	defaultUDPPortCst        = "6666"
+	defaultGroupAddressCst   = "232.0.0.1"
+	defaultSourceAddresssCst = "10.10.20.1"
+
+	readBytesCst    = 1500
+	readDeadlineCst = 10 * time.Second
+
+	intHACK = "gre"
+
+	baseTen   = 10
+	bitSize64 = 64
 )
 
 var (
@@ -89,8 +122,9 @@ func main() {
 
 	dl := flag.Int("dl", debugLevelCst, "nasty debugLevel")
 
-	ip := flag.String("ip",defaultIPAddressCst, "Multicast socket ip address")
-	port := flag.Int("port",defaultUDPPortCst,"Multicast UDP port")
+	group := flag.String("group", defaultGroupAddressCst, "Multicast group address")
+	source := flag.String("source", defaultSourceAddresssCst, "SSM source IP")
+	port := flag.String("port", defaultUDPPortCst, "Multicast UDP port")
 
 	log.Println("Parse")
 	flag.Parse()
@@ -102,32 +136,39 @@ func main() {
 
 	debugLevel = *dl
 
-	if debugLevel > 11 {
+	if debugLevel > 10 {
 		log.Println("initPromHandler")
 	}
 
 	go initPromHandler(ctx, *promPath, *promListen)
 
-	a := net.ParseIP(*ip)
-	if a == nil {
-		log.Fatal(fmt.Errorf("bad address: '%s'", *ip))
-	}
-
-	if debugLevel > 11 {
+	if debugLevel > 10 {
 		log.Println("mcastOpening")
 	}
-	s,err := mcastOpen(a, *port)
-	if err != nil{
-		log.Fatal("mcastOpen err",err)
+
+	//ifi := &net.Interface{}
+	ifi, err2 := net.InterfaceByName(intHACK)
+	if err2 != nil {
+		log.Fatal(err2)
 	}
 
-	if debugLevel > 11 {
+	p, err := JoinSSM(*group, *source, *port, ifi)
+	if err != nil {
+		log.Fatal("JoinSSM err", err)
+	}
+
+	if debugLevel > 10 {
 		log.Println("readLoop")
 	}
 
-	readLoop(s)
+	readLoop(p)
 
-	s.Close()
+	lErr := LeaveSSM(*group, *source, *port, ifi, p)
+	if lErr != nil {
+		log.Fatal("LeaveSSM lErr", lErr)
+	}
+
+	p.Close()
 
 	log.Println("main: That's all Folks!")
 }
@@ -162,131 +203,150 @@ func initPromHandler(ctx context.Context, promPath string, promListen string) {
 	}()
 }
 
-func mcastOpen(bindAddr net.IP, port int) (*ipv4.PacketConn, error) {
+// Borrowed from
+// https://github.com/tongxinCode/mping/blob/master/multicast/listener.go
 
-	startTime := time.Now()
-	defer func() {
-		pH.WithLabelValues("mcastOpen", "start", "complete").Observe(time.Since(startTime).Seconds())
-	}()
-	pC.WithLabelValues("mcastOpen", "start", "counter").Inc()
+// JoinSSM Join the SSM group
+func JoinSSM(group string, sourceAddress string, port string, ifi *net.Interface) (*ipv4.PacketConn, error) {
 
-	// https://pkg.go.dev/syscall#Socket
-	// https://pkg.go.dev/syscall#pkg-constants
-	//s, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_UDP)
-	s, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.AF_UNSPEC)
+	// See also
+	//https://pkg.go.dev/net#ListenMulticastUDP
+	a := net.ParseIP(group)
+	i, err := strconv.ParseInt(port, baseTen, bitSize64)
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
-	if err := syscall.SetsockoptInt(s, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
-		log.Fatal(err)
-	}
-
-	// Dave - NOT doing this for now.  I don't think it's required.  Testing....
-	// //syscall.SetsockoptInt(s, syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
-	// if err := syscall.SetsockoptString(s, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, ifname); err != nil {
-	// 	log.Fatal(err)
-	// }
-
-	lsa := syscall.SockaddrInet4{Port: port}
-	copy(lsa.Addr[:], bindAddr.To4())
-
-	if err := syscall.Bind(s, &lsa); err != nil {
-		syscall.Close(s)
-		log.Fatal(err)
-	}
-
-	// start hack
-
-	// https://cs.opensource.google/go/go/+/refs/tags/go1.21.4:src/syscall/ztypes_linux_amd64.go;l=216
-	// type IPMreq struct {
-	// 	Multiaddr [4]byte /* in_addr */
-	// 	Interface [4]byte /* in_addr */
-	// }
-
-	// type IPMreqn struct {
-	// 	Multiaddr [4]byte /* in_addr */
-	// 	Address   [4]byte /* in_addr */
-	// 	Ifindex   int32
-	// }
-
-	// https://github.com/torvalds/linux/blob/9b6de136b5f0158c60844f85286a593cb70fb364/include/uapi/linux/in.h#L178
-	// struct ip_mreq  {
-	// 	struct in_addr imr_multiaddr;	/* IP multicast address of group */
-	// 	struct in_addr imr_interface;	/* local IP address of interface */
-	// };
-
-	// struct ip_mreqn {
-	// 	struct in_addr	imr_multiaddr;		/* IP multicast address of group */
-	// 	struct in_addr	imr_address;		/* local IP address of interface */
-	// 	int		imr_ifindex;		/* Interface index */
-	// };
-
-	// struct ip_mreq_source {               <---- MISSING FROM GOLANG
-	// 	__be32		imr_multiaddr;
-	// 	__be32		imr_interface;
-	// 	__be32		imr_sourceaddr;
-	// };
-
-	// Try this hack.  Use ip_mreqn instead of ip_mreq_source
-	// https://pkg.go.dev/syscall#SetsockoptIPMreqn
-	//
-	// Golang does have "IP_ADD_SOURCE_MEMBERSHIP         = 0x27" ( https://pkg.go.dev/syscall#pkg-constants )
-
-	sourceAddress := []byte{0x01,0x01,0x01,0x01}
-	var sa uint32
-	binary.LittleEndian.PutUint32(sourceAddress, sa)
-	ipMreqSourceHack := &syscall.IPMreqn{
-		//imr_multiaddr;
-		//imr_interface;       <----- defaults to zero (0) in golang, so this will defer to the kernel, which is what we want
-		Ifindex:	int32(sa), // Ifindex is really imr_sourceaddr
-	}
-
-	if err := syscall.SetsockoptIPMreqn(s, syscall.IPPROTO_IP , syscall.IP_ADD_SOURCE_MEMBERSHIP, ipMreqSourceHack); err != nil {
-		log.Fatal(err)
-	}
-
-	// end hack
-
-
-	f := os.NewFile(uintptr(s), "")
-	c, err := net.FilePacketConn(f)
-	f.Close()
+	ipv4Addr := &net.UDPAddr{IP: a, Port: int(i)}
+	c, err := net.ListenUDP("udp", ipv4Addr)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
+	if debugLevel > 100 {
+		log.Println("ListenPacket complete")
+	}
+
 	p := ipv4.NewPacketConn(c)
+	addr, err := net.ResolveUDPAddr("udp", group+":"+port)
+	if err != nil {
+		return nil, err
+	}
+	if debugLevel > 100 {
+		log.Println("ResolveUDPAddr address complete")
+	}
+
+	sourceAddr, err := net.ResolveUDPAddr("udp", sourceAddress+":")
+	if err != nil {
+		return nil, err
+	}
+	if debugLevel > 100 {
+		log.Println("ResolveUDPAddr sourceAddr complete")
+	}
+
+	err = p.JoinSourceSpecificGroup(ifi, addr, sourceAddr)
+	if err != nil {
+		if debugLevel > 10 {
+			log.Println("JoinSourceSpecificGroup err", err)
+		}
+		return nil, err
+	}
 
 	return p, nil
 }
 
+// LeaveSSM: Leave the SSM group
+func LeaveSSM(address string, sourceAddress string, port string, ifi *net.Interface, conn *ipv4.PacketConn) error {
+
+	addr, err := net.ResolveUDPAddr("udp", address+":"+port)
+	if err != nil {
+		return err
+	}
+
+	sourceAddr, err := net.ResolveUDPAddr("udp", sourceAddress+":")
+	if err != nil {
+		return err
+	}
+
+	err = conn.LeaveSourceSpecificGroup(ifi, addr, sourceAddr)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// readLoops reads packets from the socket
+// https://pkg.go.dev/golang.org/x/net/ipv4
 func readLoop(c *ipv4.PacketConn) {
 
 	log.Printf("readLoop: reading")
 
-	buf := make([]byte, 10000)
+	err := c.SetControlMessage(ipv4.FlagTTL|ipv4.FlagSrc|ipv4.FlagDst|ipv4.FlagInterface, true)
+	if err != nil {
+		panic(err)
+	}
 
-	for {
-		n, cm, _, err1 := c.ReadFrom(buf)
-		if err1 != nil {
-			log.Printf("readLoop: ReadFrom: error %v", err1)
+	var lastSequenceNumber uint16
+
+	buf := make([]byte, readBytesCst)
+
+	for i := 0; ; i++ {
+		pC.WithLabelValues("readloop", "for", "counter").Inc()
+
+		// Could set a ReadDealine here
+		// https://pkg.go.dev/golang.org/x/net/ipv4#PacketConn.SetReadDeadline
+		err := c.SetReadDeadline(time.Now().Add(readDeadlineCst))
+		if err != nil {
+			panic(err)
+		}
+
+		if debugLevel > 100 {
+			log.Printf("blocking read")
+		}
+
+		startReadTime := time.Now()
+		//n, cm, src, err := c.ReadFrom(buf)
+		n, cm, _, err := c.ReadFrom(buf)
+		if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+			if debugLevel > 10 {
+				log.Print("syscall.Recvfrom timeout after:", readDeadlineCst.String())
+			}
+			continue
+		}
+		if err != nil {
+			log.Printf("readLoop: ReadFrom: error %v", err)
 			break
 		}
-
-		var name string
-
-		ifi, err2 := net.InterfaceByIndex(cm.IfIndex)
-		if err2 != nil {
-			log.Printf("readLoop: unable to solve ifIndex=%d: error: %v", cm.IfIndex, err2)
+		since := time.Since(startReadTime)
+		pH.WithLabelValues("readloop", "ReadFrom", "counter").Observe(float64(since.Seconds()))
+		pC.WithLabelValues("readloop", "n", "counter").Add(float64(n))
+		if i == 0 {
+			log.Printf("first read time seconds:%f", since.Seconds())
 		}
 
-		if ifi == nil {
-			name = "ifname?"
-		} else {
-			name = ifi.Name
+		p := rtp.Packet{}
+		errU := p.Unmarshal(buf[:n])
+		if errU != nil {
+			panic(errU)
 		}
 
-		log.Printf("readLoop: recv %d bytes from %s to %s on %s", n, cm.Src, cm.Dst, name)
+		if !cm.Dst.IsMulticast() {
+			pC.WithLabelValues("readloop", "not_multicast", "counter").Add(float64(n))
+		}
+
+		log.Printf("readLoop: recv %d bytes from %s to %s", n, cm.Src, cm.Dst)
+
+		log.Print("p\n", p, "\n")
+
+		checkSequenceNumber(p.Header.SequenceNumber, lastSequenceNumber)
 	}
 
 	log.Printf("readLoop: exiting")
+}
+
+func checkSequenceNumber(current uint16, last uint16) {
+	if current != last {
+		if last != 0 {
+			pC.WithLabelValues("readloop", "sequenceUnexpected", "counter").Add(float64(1 * last))
+		}
+	}
 }

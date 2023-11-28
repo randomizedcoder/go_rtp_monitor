@@ -30,6 +30,6 @@ version:
 	./${BINARY} --version
 
 curl:
-	curl http://localhost:9901/metrics
+	curl --silent http://localhost:9901/metrics
 
 #
