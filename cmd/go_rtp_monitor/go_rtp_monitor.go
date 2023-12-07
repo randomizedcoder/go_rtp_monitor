@@ -66,7 +66,7 @@ const (
 	readBytesCst    = 1500
 	readDeadlineCst = 10 * time.Second
 
-	intHACK = "gre"
+	interfaceCst = "gre"
 
 	baseTen   = 10
 	bitSize64 = 64
@@ -125,6 +125,7 @@ func main() {
 	group := flag.String("group", defaultGroupAddressCst, "Multicast group address")
 	source := flag.String("source", defaultSourceAddresssCst, "SSM source IP")
 	port := flag.String("port", defaultUDPPortCst, "Multicast UDP port")
+	intf := flag.String("intf", interfaceCst, "Network interface to recieve on")
 
 	log.Println("Parse")
 	flag.Parse()
@@ -147,7 +148,7 @@ func main() {
 	}
 
 	//ifi := &net.Interface{}
-	ifi, err2 := net.InterfaceByName(intHACK)
+	ifi, err2 := net.InterfaceByName(*intf)
 	if err2 != nil {
 		log.Fatal(err2)
 	}
