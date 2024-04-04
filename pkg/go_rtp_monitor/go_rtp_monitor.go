@@ -12,6 +12,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"golang.org/x/net/ipv4"
+
+	"github.com/randomizedcoder/goTrackRTP"
 )
 
 // sudo ip route add 224/4 dev virbr0
@@ -102,15 +104,16 @@ type rtpMonitor struct {
 	port       string
 
 	p *ipv4.PacketConn
+
+	tr *goTrackRTP.Tracker
+	tm *goTrackRTP.TrackIntToStringMap
 }
 
 // NewRTPMonitor creates the rtpGenerator, and opens the UDP socket
 func NewRTPMonitor(
 	debugLevel int,
-	intf string,
-	source string,
-	group string,
-	port string,
+	intf, source, group, port string,
+	aw, bw, ab, bb uint16,
 ) *rtpMonitor {
 
 	m := new(rtpMonitor)
@@ -137,6 +140,14 @@ func NewRTPMonitor(
 	if debugLevel > 10 {
 		log.Println("multicast socket opened")
 	}
+
+	var errN error
+	m.tr, errN = goTrackRTP.New(aw, bw, ab, bb, debugLevel)
+	if errN != nil {
+		log.Fatal("goTrackRTP.New:", errN)
+	}
+
+	m.tm = goTrackRTP.NewMaps()
 
 	return m
 }
@@ -242,8 +253,8 @@ func (m *rtpMonitor) Monitor() {
 		log.Fatal("SetControlMessage error", err)
 	}
 
-	var lastConsistentSequenceTime time.Time
-	var lastSequenceNumber uint16
+	// var lastConsistentSequenceTime time.Time
+	// var lastSequenceNumber uint16
 	sketch, err := ddsketch.NewDefaultDDSketch(sketchRelativeAccuracyCst)
 	if err != nil {
 		log.Fatal("NewDefaultDDSketch error", err)
@@ -261,7 +272,8 @@ func (m *rtpMonitor) Monitor() {
 			log.Println("readloop() i:", i)
 		}
 
-		n, recieveTime, since, err := m.readPacket(m.p, &buf)
+		//n, recieveTime, since, err := m.readPacket(m.p, &buf)
+		n, _, since, err := m.readPacket(m.p, &buf)
 		if err != nil {
 			pC.WithLabelValues("readloop", "readPacket", "error").Inc()
 			if m.debugLevel > 10 {
@@ -309,15 +321,26 @@ func (m *rtpMonitor) Monitor() {
 			log.Print("p\n", p, "\n")
 		}
 
-		if m.inconsistentSequence(p.Header.SequenceNumber, lastSequenceNumber) {
-			sinceConsistent := recieveTime.Sub(lastConsistentSequenceTime)
-			if m.debugLevel > 10 {
-				log.Println("sinceConsistent:", sinceConsistent)
-			}
+		tax, err := m.tr.PacketArrival(p.Header.SequenceNumber)
+		if err != nil {
+			log.Println("m.tr.PacketArrival(p.Header.SequenceNumber) err:", err)
 		}
 
-		lastSequenceNumber = p.SequenceNumber
-		lastConsistentSequenceTime = recieveTime
+		pos, c, sc := m.taxConstIntToString(tax)
+		if m.debugLevel > 10 {
+			log.Printf("pos:%s, c:%s, sc:%s", pos, c, sc)
+		}
+		pC.WithLabelValues(pos, c, sc).Inc()
+
+		// if m.inconsistentSequence(p.Header.SequenceNumber, lastSequenceNumber) {
+		// 	sinceConsistent := recieveTime.Sub(lastConsistentSequenceTime)
+		// 	if m.debugLevel > 10 {
+		// 		log.Println("sinceConsistent:", sinceConsistent)
+		// 	}
+		// }
+
+		// lastSequenceNumber = p.SequenceNumber
+		// lastConsistentSequenceTime = recieveTime
 
 	}
 }
@@ -373,17 +396,27 @@ func (m *rtpMonitor) readPacket(c *ipv4.PacketConn, buf *[]byte) (int, time.Time
 	return n, recieveTime, since, nil
 }
 
-func (m *rtpMonitor) inconsistentSequence(current uint16, last uint16) (inconsistent bool) {
-	if last != 0 {
-		jump := current - (last + 1)
-		if jump != 0 {
-			inconsistent = true
-			pC.WithLabelValues("readloop", "inconsistentSequence", "counter").Inc()
-			pC.WithLabelValues("readloop", "sequenceJump", "counter").Add(float64(jump))
-			if m.debugLevel > 10 {
-				log.Printf("inconsistentSequence current:%d, last:%d, jump:%d", current, last, jump)
-			}
-		}
-	}
-	return inconsistent
+// func (m *rtpMonitor) inconsistentSequence(current uint16, last uint16) (inconsistent bool) {
+// 	if last != 0 {
+// 		jump := current - (last + 1)
+// 		if jump != 0 {
+// 			inconsistent = true
+// 			pC.WithLabelValues("readloop", "inconsistentSequence", "counter").Inc()
+// 			pC.WithLabelValues("readloop", "sequenceJump", "counter").Add(float64(jump))
+// 			if m.debugLevel > 10 {
+// 				log.Printf("inconsistentSequence current:%d, last:%d, jump:%d", current, last, jump)
+// 			}
+// 		}
+// 	}
+// 	return inconsistent
+// }
+
+// taxConstIntToString maps the tax const ints to strings to feed to prometheus counters
+func (m *rtpMonitor) taxConstIntToString(tax *goTrackRTP.Taxonomy) (position, category, subcategory string) {
+
+	position = m.tm.PosMap[tax.Position]
+	category = m.tm.CatMap[tax.Categroy]
+	subcategory = m.tm.SubCatMap[tax.SubCategory]
+
+	return position, category, subcategory
 }

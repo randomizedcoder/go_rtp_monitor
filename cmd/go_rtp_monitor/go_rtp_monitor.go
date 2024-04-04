@@ -29,8 +29,12 @@ const (
 	defaultUDPPortCst        = "6666"
 	defaultGroupAddressCst   = "232.0.0.1"
 	defaultSourceAddresssCst = "10.10.20.1"
+	interfaceCst             = "gre"
 
-	interfaceCst = "gre"
+	awCst = 100
+	bwCst = 100
+	abCst = 100
+	bbCst = 100
 )
 
 var (
@@ -65,6 +69,11 @@ func main() {
 	group := flag.String("group", defaultGroupAddressCst, "Multicast group address")
 	port := flag.String("port", defaultUDPPortCst, "Multicast UDP port")
 
+	aw := flag.Int("aw", awCst, "ahead window")
+	bw := flag.Int("bw", bwCst, "behind window")
+	ab := flag.Int("ab", abCst, "ahead buffer")
+	bb := flag.Int("bb", bbCst, "behind buffer")
+
 	flag.Parse()
 
 	if *version {
@@ -82,10 +91,8 @@ func main() {
 
 	m := go_rtp_monitor.NewRTPMonitor(
 		*dl,
-		*intf,
-		*source,
-		*group,
-		*port,
+		*intf, *source, *group, *port,
+		uint16(*aw), uint16(*bw), uint16(*ab), uint16(*bb),
 	)
 
 	if debugLevel > 10 {
