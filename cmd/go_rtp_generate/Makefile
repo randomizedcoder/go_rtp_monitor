@@ -6,7 +6,7 @@
 # short commit hash
 COMMIT :=$(shell /usr/bin/git describe --always)
 DATE :=$(shell /bin/date -u +"%Y-%m-%d-%H:%M")
-BINARY :=go_rtp_monitor
+BINARY :=go_rtp_generate
 
 all: clean build version
 
@@ -30,8 +30,8 @@ version:
 	./${BINARY} --version
 
 curl:
-	curl --silent http://localhost:9901/metrics
+	curl --silent http://localhost:9902/metrics
 
 lab:
-	./go_rtp_monitor -group 232.0.0.1 -port 6666 -intf br-siden -source 10.99.0.1
+	./${BINARY} -loop
 #
